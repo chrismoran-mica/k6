@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/reflection"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 
 	"github.com/dop251/goja"
 	"github.com/golang/protobuf/ptypes/any"
@@ -955,7 +957,7 @@ func TestClient_TlsParameters(t *testing.T) {
 			initString: codeBlock{code: "var client = new grpc.Client();"},
 			vuString: codeBlock{
 				code: `client.connect("GRPCBIN_ADDR", { tls: { cert: "", key: "", cacerts: 0 }});`,
-				err:  `invalid grpc.connect() parameters: invalid tls cacerts value: 'map[string]interface {}{"cacerts":0, "cert":"", "key":""}', it needs to be a string or string[] of PEM formatted strings`,
+				err:  `invalid grpc.connect() parameters: invalid tls cacerts value: 'map[string]interface {}{"cacerts":0, "cert":"", "key":""}', it needs to be a string or an array of PEM formatted strings`,
 			},
 		},
 		{
@@ -1001,7 +1003,7 @@ func TestClient_TlsParameters(t *testing.T) {
 			},
 			initString: codeBlock{code: `var client = new grpc.Client();`},
 			vuString: codeBlock{
-				code: fmt.Sprintf(`client.connect("GRPCBIN_ADDR", { timeout: '5s', tls: { cacerts: ["%s"], cert: "%s", key: "%s" }});`,
+				code: fmt.Sprintf(`client.connect("GRPCBIN_ADDR", { tls: { cacerts: ["%s"], cert: "%s", key: "%s" }});`,
 					localHostCert,
 					clientAuthBad,
 					clientAuthKey),
@@ -1019,7 +1021,7 @@ func TestClient_TlsParameters(t *testing.T) {
 			initString: codeBlock{code: `var client = new grpc.Client();`},
 			vuString: codeBlock{
 				code: fmt.Sprintf(`
-				client.connect("GRPCBIN_ADDR", { timeout: '5s', tls: { cacerts: ["%s"], cert: "%s", key: "%s", password: "%s" }});
+				client.connect("GRPCBIN_ADDR", { tls: { cacerts: ["%s"], cert: "%s", key: "%s", password: "%s" }});
 				`,
 					localHostCert,
 					clientAuthBad,
@@ -1228,4 +1230,65 @@ func TestClientInvokeHeadersDeprecated(t *testing.T) {
 	entries := logHook.Drain()
 	require.Len(t, entries, 1)
 	require.Contains(t, entries[0].Message, "headers property is deprecated")
+}
+
+func TestClientLoadProto(t *testing.T) {
+	t.Parallel()
+
+	type testState struct {
+		*modulestest.Runtime
+		httpBin *httpmultibin.HTTPMultiBin
+		samples chan metrics.SampleContainer
+	}
+	setup := func(t *testing.T) testState {
+		t.Helper()
+
+		tb := httpmultibin.NewHTTPMultiBin(t)
+		samples := make(chan metrics.SampleContainer, 1000)
+		testRuntime := modulestest.NewRuntime(t)
+
+		cwd, err := os.Getwd() //nolint:forbidigo
+		require.NoError(t, err)
+		fs := fsext.NewOsFs()
+		if isWindows {
+			fs = fsext.NewTrimFilePathSeparatorFs(fs)
+		}
+		testRuntime.VU.InitEnvField.CWD = &url.URL{Path: cwd}
+		testRuntime.VU.InitEnvField.FileSystems = map[string]fsext.Fs{"file": fs}
+
+		return testState{
+			Runtime: testRuntime,
+			httpBin: tb,
+			samples: samples,
+		}
+	}
+
+	ts := setup(t)
+
+	m, ok := New().NewModuleInstance(ts.VU).(*ModuleInstance)
+	require.True(t, ok)
+	require.NoError(t, ts.VU.Runtime().Set("grpc", m.Exports().Named))
+
+	code := `
+		var client = new grpc.Client();
+		client.load([], "../../../../lib/testutils/httpmultibin/grpc_testing/nested_types.proto");`
+
+	_, err := ts.VU.Runtime().RunString(ts.httpBin.Replacer.Replace(code))
+	assert.Nil(t, err, "It was not expected that there would be an error, but it got: %v", err)
+
+	expectedTypes := []string{
+		"grpc.testing.Outer",
+		"grpc.testing.Outer.MiddleAA",
+		"grpc.testing.Outer.MiddleAA.Inner",
+		"grpc.testing.Outer.MiddleBB",
+		"grpc.testing.Outer.MiddleBB.Inner",
+		"grpc.testing.MeldOuter",
+	}
+
+	for _, expected := range expectedTypes {
+		found, err := protoregistry.GlobalTypes.FindMessageByName(protoreflect.FullName(expected))
+
+		assert.NotNil(t, found, "Expected to find the message type %s, but an error occurred", expected)
+		assert.Nil(t, err, "It was not expected that there would be an error, but it got: %v", err)
+	}
 }

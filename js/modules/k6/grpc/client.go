@@ -115,12 +115,12 @@ func (c *Client) LoadProtoset(protosetPath string) ([]MethodInfo, error) {
 func decryptPrivateKey(key, password []byte) ([]byte, error) {
 	block, _ := pem.Decode(key)
 	if block == nil {
-		return nil, fmt.Errorf("failed to decode PEM key")
+		return nil, errors.New("failed to decode PEM key")
 	}
 
 	blockType := block.Type
 	if blockType == "ENCRYPTED PRIVATE KEY" {
-		return nil, fmt.Errorf("encrypted pkcs8 formatted key is not supported")
+		return nil, errors.New("encrypted pkcs8 formatted key is not supported")
 	}
 	/*
 	   Even though `DecryptPEMBlock` has been deprecated since 1.16.x it is still
@@ -222,13 +222,11 @@ func (c *Client) Connect(addr string, params map[string]interface{}) (bool, erro
 
 	var tcred credentials.TransportCredentials
 	if !p.IsPlaintext {
-		var tlsCfg *tls.Config
+		tlsCfg := state.TLSConfig.Clone()
 		if len(p.TLS) > 0 {
-			if tlsCfg, err = buildTLSConfigFromMap(state.TLSConfig.Clone(), p.TLS); err != nil {
+			if tlsCfg, err = buildTLSConfigFromMap(tlsCfg, p.TLS); err != nil {
 				return false, err
 			}
-		} else {
-			tlsCfg = state.TLSConfig.Clone()
 		}
 		tlsCfg.NextProtos = []string{"h2"}
 
@@ -406,8 +404,16 @@ func (c *Client) convertToMethodInfo(fdset *descriptorpb.FileDescriptorSet) ([]M
 			}
 		}
 		messages := fd.Messages()
+
+		stack := make([]protoreflect.MessageDescriptor, 0, messages.Len())
 		for i := 0; i < messages.Len(); i++ {
-			message := messages.Get(i)
+			stack = append(stack, messages.Get(i))
+		}
+
+		for len(stack) > 0 {
+			message := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+
 			_, errFind := protoregistry.GlobalTypes.FindMessageByName(message.FullName())
 			if errors.Is(errFind, protoregistry.NotFound) {
 				err = protoregistry.GlobalTypes.RegisterMessage(dynamicpb.NewMessageType(message))
@@ -415,7 +421,13 @@ func (c *Client) convertToMethodInfo(fdset *descriptorpb.FileDescriptorSet) ([]M
 					return false
 				}
 			}
+
+			nested := message.Messages()
+			for i := 0; i < nested.Len(); i++ {
+				stack = append(stack, nested.Get(i))
+			}
 		}
+
 		return true
 	})
 	if err != nil {
@@ -570,12 +582,12 @@ func (c *Client) parseConnectParams(raw map[string]interface{}) (connectParams, 
 					for _, cacertsArrayEntry := range cacertsArray {
 						if _, ok = cacertsArrayEntry.(string); !ok {
 							return params, fmt.Errorf("invalid tls cacerts value: '%#v',"+
-								" it needs to be a string or string[] of PEM formatted strings", v)
+								" it needs to be a string or an array of PEM formatted strings", v)
 						}
 					}
 				} else if _, ok = cacerts.(string); !ok {
 					return params, fmt.Errorf("invalid tls cacerts value: '%#v',"+
-						" it needs to be a string or string[] of PEM formatted strings", v)
+						" it needs to be a string or an array of PEM formatted strings", v)
 				}
 			}
 		default:
