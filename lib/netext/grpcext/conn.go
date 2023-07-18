@@ -4,11 +4,13 @@ package grpcext
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"go.k6.io/k6/lib"
 	"go.k6.io/k6/metrics"
@@ -51,14 +53,18 @@ type clientConnCloser interface {
 
 // Conn is a gRPC client connection.
 type Conn struct {
-	addr string
-	raw  clientConnCloser
+	addr   string
+	shares atomic.Uint64
+	raw    clientConnCloser
 }
 
 var (
-	connections       = make(map[string]*grpc.ClientConn, 2)
-	connectionsAddrMu = make(map[string]*sync.Mutex, 2)
-	connectionsMu     sync.Mutex
+	// Is there any other way?
+
+	//nolint:golint,gochecknoglobals
+	connections = &sync.Map{}
+	//nolint:golint,gochecknoglobals
+	connectionsAddrMu = &sync.Map{}
 )
 
 // DefaultOptions generates an option set
@@ -91,42 +97,80 @@ func Dial(ctx context.Context, addr string, options ...grpc.DialOption) (*Conn, 
 // DialShared establish a gRPC connection if a shared connection for the same address does not already exist.
 // Note: only use a shared connection over the same address if the service is the same OR if multiple services are muxed
 // over this shared address.
-func DialShared(ctx context.Context, addr string, options ...grpc.DialOption) (*Conn, error) {
+func DialShared(ctx context.Context, addr string, connectionSharing uint64, options ...grpc.DialOption) (*Conn, error) {
 	var (
-		conn *grpc.ClientConn
-		err  error
+		iconn interface{}
+		conn  []*Conn
+		raw   *grpc.ClientConn
+		err   error
 	)
 	var ok bool
 
 	var addrMu *sync.Mutex
 	// Lock for mutating connectionsAddrMu map
-	connectionsMu.Lock()
-	if addrMu, ok = connectionsAddrMu[addr]; !ok {
-		addrMu = &sync.Mutex{}
-		connectionsAddrMu[addr] = addrMu
+	if addrMuEntry, _ := connectionsAddrMu.LoadOrStore(addr, &sync.Mutex{}); addrMuEntry != nil {
+		if addrMu, ok = addrMuEntry.(*sync.Mutex); ok {
+			// Lock for mutating connections map
+			addrMu.Lock()
+			defer addrMu.Unlock()
+		}
 	}
-	// Lock for mutating connections map
-	addrMu.Lock()
-	connectionsMu.Unlock()
-	defer addrMu.Unlock()
+	if addrMu == nil {
+		return nil, errors.New("unable to find connection address mutex, this should not happen")
+	}
+
 	// As we may modify the clients map
 	// We lock to ensure we only open a single connection and add it to the map. Subsequent consumers will obtain
 	// the dialed connection.
-	if conn, ok = connections[addr]; !ok {
-		conn, err = grpc.DialContext(ctx, addr, options...)
+	// Get the connections array and check if the number of available tickets is
+	if iconn, ok = connections.Load(addr); !ok {
+		raw, err = grpc.DialContext(ctx, addr, options...)
 		if err != nil {
 			return nil, err
 		}
-		connections[addr] = conn
+		conn = make([]*Conn, 0)
+		newConn := &Conn{
+			addr:   addr,
+			raw:    raw,
+			shares: atomic.Uint64{},
+		}
+		newConn.shares.Store(connectionSharing)
+		conn = append(conn, newConn)
+		connections.Store(addr, conn)
+	} else {
+		if conn, ok = iconn.([]*Conn); ok {
+			if conn[len(conn)-1].shares.CompareAndSwap(1, 0) {
+				raw, err = grpc.DialContext(ctx, addr, options...)
+				if err != nil {
+					return nil, err
+				}
+				newConn := &Conn{
+					addr:   addr,
+					raw:    raw,
+					shares: atomic.Uint64{},
+				}
+				newConn.shares.Store(connectionSharing)
+				conn = append(conn, newConn)
+				connections.Store(addr, conn)
+			} else {
+				conn[len(conn)-1].shares.Add(^uint64(0))
+			}
+		}
 	}
 
 	if err != nil {
 		return nil, err
 	}
-	return &Conn{
-		addr: addr,
-		raw:  conn,
-	}, nil
+	return conn[len(conn)-1], nil
+}
+
+// Equals compares two Conn pointers for equality of `addr` and `raw` connection.
+// See: Client connectParams ConnectionSharing parameter
+func (c *Conn) Equals(conn *Conn) bool {
+	if c.raw == nil || c.addr == "" || conn == nil || conn.raw == nil || conn.addr == "" {
+		return false
+	}
+	return c.raw == conn.raw && c.addr == conn.addr
 }
 
 // Reflect returns using the reflection the FileDescriptorSet describing the service.
@@ -221,11 +265,25 @@ func (c *Conn) Invoke(
 func (c *Conn) Close() error {
 	if c.addr != "" {
 		// Lock for mutating connections map
-		if addrMu, ok := connectionsAddrMu[c.addr]; ok {
-			addrMu.Lock()
-			// no need to close as it will close below, just need to remove connection from shared map
-			delete(connections, c.addr)
-			addrMu.Unlock()
+		var addrMu *sync.Mutex
+		// Lock for mutating connectionsAddrMu map
+		if addrMuEntry, ok := connectionsAddrMu.Load(c.addr); ok && addrMuEntry != nil {
+			if addrMu, ok = addrMuEntry.(*sync.Mutex); ok {
+				addrMu.Lock()
+				if iconn, cok := connections.Load(c.addr); cok {
+					conn, convok := iconn.([]*Conn)
+					if convok {
+						for _, cconn := range conn {
+							if cconn.raw != c.raw {
+								// TODO: bubble errors up?
+								_ = cconn.raw.Close()
+							}
+						}
+					}
+				}
+				connections.Delete(c.addr)
+				addrMu.Unlock()
+			}
 		}
 	}
 
